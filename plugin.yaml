@@ -1,7 +1,7 @@
 name: nextcloud-talk-platform
 label: Nextcloud Talk
 kind: platform
-version: 1.17.2
+version: 1.18.0
 description: >
   Two Nextcloud Talk connectors for Hermes Agent in one plugin: a webhook
   bot (Nextcloud Talk Bot API, HMAC-signed) and a real Nextcloud user
@@ -254,4 +254,22 @@ optional_env:
       skcall-join-<estate>@<call room> instead of skcall-join@<chat room>, so
       the agent joins the host's call natively. Example: m4jyfpxq:nam:og63pxfh
     prompt: "Call room map (chat:estate:callroom, optional)"
+    password: false
+  - name: NEXTCLOUD_TALK_CALL_AUTOJOIN
+    description: >-
+      Answer a ringing call on the agent's own, without being asked: when a
+      user rings a room, Talk posts a 'call_started' system message and the
+      adapter calls call_join for it. 'dm' (default) only for one-to-one
+      rooms and group rooms that are a private pair with one allowed user
+      (calls sent directly to the agent); 'auto' also joins real group rooms
+      when an allowed user rings; 'off' never joins. Needs
+      NEXTCLOUD_TALK_CALL_TOOLS=on and the skcall unit; a 60 s debounce keeps
+      repeated rings from stacking joins.
+    prompt: "Auto-answer rings? (dm/auto/off, default dm)"
+    password: false
+  - name: NEXTCLOUD_TALK_CALL_AUTOJOIN_GREETING
+    description: >-
+      Optional line the agent says when it auto-joins (max 300 chars, handed
+      to the skcall unit as SKCALL_GREETING). Empty: skcall's own default.
+    prompt: "Auto-join greeting (optional)"
     password: false

@@ -559,6 +559,19 @@ the room's chat when the call ends. Without the unit installed, `call_join`
 says so and does nothing. Tool descriptions tell the model to use these tools
 for every join/leave request and never to launch skcall through the terminal.
 
+**Auto-answering a ring.** With `NEXTCLOUD_TALK_CALL_AUTOJOIN` (default `dm`)
+the adapter reacts to Talk's `call_started` system message itself: when an
+allowed user rings, the agent calls `call_join` without waiting to be asked.
+`dm` answers only calls sent directly to the agent -- one-to-one rooms, and
+group rooms that are just the agent and one allowed user; a real group call
+still needs an explicit request. `auto` also joins group rooms, `off`
+disables the behavior (rings are ignored, as before). Guests, bots, the
+agent's own echo and non-allowed callers never trigger a join. Repeated rings
+for the same room within 60 s join once. An optional spoken hello comes from
+`NEXTCLOUD_TALK_CALL_AUTOJOIN_GREETING` (passed as the unit's `SKCALL_GREETING`).
+The handler imports the call tools directly (no model turn involved), runs
+off the poll loop via a thread, and logs one `call auto-join` line per ring.
+
 **Federated rooms.** A federated room is a chat copy of a room hosted on
 another Nextcloud; the call lives on the host. `NEXTCLOUD_TALK_CALL_ROOM_MAP`
 (`<chat room>:<estate>:<call room>,...`) maps such a room to the host's call:

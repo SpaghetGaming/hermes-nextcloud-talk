@@ -252,6 +252,26 @@ VALID_ROOM_MODES = frozenset({ROOM_MODE_MENTION, ROOM_MODE_WATCH, ROOM_MODE_FREE
 # group, type 2), run in this mode unless NEXTCLOUD_TALK_ROOM_MODES lists them.
 DM_MODE_ENV = "NEXTCLOUD_TALK_DM_MODE"
 DEFAULT_DM_MODE = ROOM_MODE_FREE
+# Call auto-join: when a caller rings a room (the "call_started" system
+# message), answer it through the call tools instead of waiting for someone
+# to type "join the call". NEXTCLOUD_TALK_CALL_AUTOJOIN picks the scope:
+#   dm   (default) only one-to-one rooms and group rooms that are a private
+#        pair of this account and one allowed user -- "calls sent directly
+#        to Hermes"; never a real group call unless asked.
+#   auto also join real group rooms when an allowed user rings.
+#   off  never join on our own; a typed request still works.
+# Joining needs the call tools (NEXTCLOUD_TALK_CALL_TOOLS=on) and the
+# skcall unit; without them the ring is ignored as before. A greeting spoken
+# on entry comes from NEXTCLOUD_TALK_CALL_AUTOJOIN_GREETING (empty: skcall's
+# default behavior).
+CALL_STARTED_MESSAGE = "call_started"
+CALL_AUTOJOIN_ENV = "NEXTCLOUD_TALK_CALL_AUTOJOIN"
+CALL_AUTOJOIN_GREETING_ENV = "NEXTCLOUD_TALK_CALL_AUTOJOIN_GREETING"
+CALL_AUTOJOIN_MODES = frozenset({"off", "dm", "auto"})
+DEFAULT_CALL_AUTOJOIN = "dm"
+# One join per room per this window: Talk can post the ring event more than
+# once (retries, multiple clients) and we must not stack joins.
+CALL_AUTOJOIN_DEBOUNCE_SECONDS = 60.0
 # A group room's participant list is re-read this often, and at once when the
 # room posts a participant-change system message.
 PAIR_REFRESH_SECONDS = 300.0
@@ -1124,6 +1144,15 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         )
         # room token -> unanswered "name: text" lines since the agent last replied
         self._room_context: Dict[str, List[str]] = {}
+        # Call auto-join (see CALL_AUTOJOIN_ENV): scope read at start so it is
+        # correct per profile, plus a per-room join debounce timeline.
+        self._call_autojoin: str = str(
+            extra.get("call_autojoin")
+            or _secret(CALL_AUTOJOIN_ENV, DEFAULT_CALL_AUTOJOIN)
+        ).strip().lower()
+        if self._call_autojoin not in CALL_AUTOJOIN_MODES:
+            self._call_autojoin = DEFAULT_CALL_AUTOJOIN
+        self._autojoined_at: Dict[str, float] = {}
         # room token -> {message id: its line in _room_context}, so an edit or
         # deletion of a still-unanswered message updates the backlog in place
         self._room_context_ids: Dict[str, Dict[str, str]] = {}
@@ -1482,6 +1511,69 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         cached = self._pair_rooms.get(token)
         return bool(cached and cached[0])
 
+    def _call_autojoin_allowed(self, token: str, caller_id: str) -> bool:
+        """May we answer this ring on our own?
+
+        ``off`` never. ``dm`` (default) only a one-to-one room, or a group
+        room that is this account plus exactly one allowed user, and the
+        caller is that other person -- a call sent directly to Hermes.
+        ``auto`` also covers real group rooms when an allowed user rings.
+        Guests and bots never trigger a join.
+        """
+        if self._call_autojoin == "off":
+            return False
+        room = self._room_meta.get(token) or {}
+        if not caller_id or caller_id == (self._username or "").lower():
+            return False
+        if not self._sender_allowed(caller_id, token):
+            return False
+        if _room_chat_type(room.get("type")) == "dm":
+            return True
+        return self._call_autojoin == "auto" or self._is_pair_room(token)
+
+    async def _maybe_autojoin_call(self, token: str, message: Dict[str, Any]) -> None:
+        """Answer a call_started ring through call_join when policy allows."""
+        if self._call_autojoin == "off":
+            return
+        try:
+            try:
+                from .. import tools as call_tools  # package import (gateway)
+            except ImportError:
+                import tools as call_tools  # flat import (tests / standalone)
+        except Exception:
+            logger.debug("[%s] call auto-join: call tools not importable", self.name)
+            return
+        if not (hasattr(call_tools, "tools_enabled")
+                and hasattr(call_tools, "call_join")):
+            return  # resolved to some other `tools` (core); not ours
+        if not call_tools.tools_enabled():
+            return
+        actor = _extract_actor(message)
+        caller = (actor.get("id") or "").lower()
+        if not self._call_autojoin_allowed(token, caller):
+            return
+        now = time.monotonic()
+        last = self._autojoined_at.get(token)
+        if last is not None and now - last < CALL_AUTOJOIN_DEBOUNCE_SECONDS:
+            return  # Talk re-posted the ring (retry / another client)
+        self._autojoined_at[token] = now
+        greeting = _secret(CALL_AUTOJOIN_GREETING_ENV, "").strip()
+        args: Dict[str, Any] = {"room": token, "other_room": True}
+        if greeting:
+            args["greeting"] = greeting[:300]
+        try:
+            raw = await asyncio.to_thread(call_tools.call_join, args)
+        except Exception as e:
+            logger.warning("[%s] call auto-join failed for room %s: %s", self.name, token, e)
+            return
+        try:
+            result = json.loads(raw)
+        except Exception:
+            result = {"status": str(raw)[:120]}
+        status = result.get("status") or result.get("error") or "no result"
+        logger.info("[%s] call auto-join: room %s rang by %s -> %s",
+                    self.name, token, caller, status)
+
     async def _discover_invitations(self) -> int:
         """Accept allowlisted pending invitations; returns how many were accepted."""
         accepted = 0
@@ -1633,6 +1725,11 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         if message.get("systemMessage") in ("poll_voted", "poll_closed", "reaction"):
             # A vote on, or a reaction to, something we asked: may be an answer.
             await self._on_answer_signal(token, message)
+            return
+        if message.get("systemMessage") == CALL_STARTED_MESSAGE:
+            # Someone rang the room: answer it ourselves when the room is
+            # private to the caller (see NEXTCLOUD_TALK_CALL_AUTOJOIN).
+            await self._maybe_autojoin_call(token, message)
             return
         if message.get("messageType") not in (None, "comment", "voice-message"):
             # Skip system messages (join/leave/call events etc).

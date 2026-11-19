@@ -4,6 +4,24 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.18.0] - 2026-11-19
+
+### Added
+
+- **Call auto-join**: the user adapter now reacts to Talk's `call_started`
+  system message and answers the ring itself through `call_join`, instead of
+  waiting for someone to type "join the call". `NEXTCLOUD_TALK_CALL_AUTOJOIN`
+  sets the scope — `dm` (default) answers only calls sent directly to the
+  agent (one-to-one rooms and private-pair group rooms), `auto` also joins
+  real group rooms when an allowed user rings, `off` restores the old
+  ignore-the-ring behavior. Guests, bots, non-allowed callers and the
+  agent's own echo never trigger a join; repeated rings for one room within
+  60 s join once. `NEXTCLOUD_TALK_CALL_AUTOJOIN_GREETING` hands the unit a
+  spoken hello (`SKCALL_GREETING`). The handler imports the call tools
+  directly — no model turn — and runs `call_join` off the poll loop in a
+  thread. Requires `NEXTCLOUD_TALK_CALL_TOOLS=on` and the skcall unit; with
+  either missing the ring is ignored exactly as before.
+
 ## [1.17.2] - 2026-11-17
 
 ### Fixed
