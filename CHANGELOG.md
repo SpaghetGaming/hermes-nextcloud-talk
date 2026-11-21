@@ -4,6 +4,28 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.19.0] - 2026-11-21
+
+### Added
+
+- **Dangerous-command (exec) approvals are answered by reaction**: the user
+  adapter now overrides `send_exec_approval`'s prompt hook, so a flagged
+  command arrives as a reaction card instead of a plain text block asking to
+  type `/approve`. The agent posts the shared approval prompt (same wording
+  and truncation rules as every platform) with a one-line legend, then seeds
+  a thumbs-up and a thumbs-down reaction on its own message. One tap by an
+  allowed person resolves that exact request: 👍 runs it once, 👎 denies it —
+  through `tools.approval.resolve_gateway_approval_card` with the
+  `gateway.approval_actor` authority check, the same path Telegram and
+  Discord buttons take, so `approvals.approvers` is honoured. ✅ and ❌ work
+  as aliases. The decision is confirmed on the card (the bot's seeds are
+  cleared and a one-line note posted); a reaction on a card that was answered
+  elsewhere (`/approve`, the dashboard) or timed out reports that instead of
+  double-answering. A Deny-only card (command too long to show whole) seeds
+  only 👎 and says so. `/approve [session|always]` and `/deny` keep working
+  exactly as before; the plain-text prompt remains the fallback when the card
+  send fails.
+
 ## [1.18.0] - 2026-11-19
 
 ### Added

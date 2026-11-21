@@ -364,6 +364,29 @@ Yes/no questions are not polls: the agent asks in one line and the person
 reacts with a check mark or a cross, which reaches the agent as a turn
 (`NEXTCLOUD_TALK_REACTION_TURNS`, default check mark and cross).
 
+### Approving dangerous commands (user mode)
+
+When a tool call is flagged as dangerous, Hermes blocks it until a human
+approves. On Talk that prompt arrives as a **reaction card** (v1.19.0): the
+agent posts the shared approval text — command, why it was flagged, deadline —
+with a one-line legend, then places a thumbs-up and a thumbs-down reaction on
+its own message. One tap decides:
+
+| Reaction | Means |
+|---|---|
+| 👍 (or ✅ / ✔) | approve this run (same as `/approve`) |
+| 👎 (or ❌ / ✖) | deny it (same as `/deny`) |
+
+Only the request that card was rendered for is answered, and only by someone
+allowed to answer approvals (the requester, `approvals.approvers`, or a chat
+admin — the same authority the typed `/approve` and the Telegram/Discord
+buttons enforce). The card clears its seeds and posts a one-line confirmation;
+if the approval was answered elsewhere (`/approve`, the dashboard) or timed
+out, a late tap says so instead of double-answering. A card that could not
+show the whole command offers 👎 only. Longer grants stay typed: `/approve
+session` and `/approve always`. If the card send fails, the plain-text prompt
+with `/approve` steps is used, as before.
+
 ### Server capabilities (user mode)
 
 Once per conversation the model is told what the chat's Talk server supports

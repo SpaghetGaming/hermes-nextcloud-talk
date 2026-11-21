@@ -74,6 +74,13 @@ Environment variables (env wins over config.yaml ``extra``):
                                              before that boundary is an error rather than a plain
                                              "nothing new")
 
+Dangerous-command (exec) approvals arrive as reaction cards: the agent posts
+the shared approval prompt with a one-line legend and seeds a thumbs-up and a
+thumbs-down reaction on its own message, so one tap by an allowed person
+approves (runs once) or denies that exact request -- the same authority-checked
+resolve path the Telegram/Discord buttons use. /approve and /deny keep working;
+/approve session|always still type their tier.
+
 Threads (Talk 22+, capability ``threads``): each thread gets its own Hermes
 session, its own context backlog and its own agent-chain counter, and replies
 go back into the thread they came from. Without the capability the adapter
@@ -374,6 +381,15 @@ DEFAULT_REACTION_TURNS = "✅,❌"  # check mark, cross
 YES_REACTIONS = frozenset({"✅", "\U0001F44D", "✔️", "✔"})
 # A "no" on an approval request (talk_workspace_write / talk_ask_owner from a guest's turn).
 APPROVAL_NO = frozenset({"\U0001F44E", "❌", "✖"})
+# A reaction on one of our dangerous-command approval cards (Hermes exec approvals,
+# sent as reaction cards by _send_exec_approval_prompt): emoji -> tools.approval choice.
+EXEC_APPROVAL_EMOJIS = {
+    "\U0001F44D": "once", "\u2705": "once", "\u2714": "once",   # 👍 ✅ ✔
+    "\U0001F44E": "deny", "\u274c": "deny", "\u2716": "deny",   # 👎 ❌ ✖
+}
+EXEC_APPROVAL_SEED = {"once": "\U0001F44D", "deny": "\U0001F44E"}
+# Cards are answered inside approvals.timeout (default 5 min); forget them after an hour.
+EXEC_APPROVAL_TTL = 3600.0
 # Server capabilities: re-read daily, told to the model once per conversation.
 CAPS_REFRESH_SECONDS = 24 * 3600.0
 CAPS_NOTE_ENV = "NEXTCLOUD_TALK_CAPABILITY_NOTE"
@@ -1085,6 +1101,35 @@ def is_connected(config) -> bool:
     return validate_config(config)
 
 
+def _schedule_on_live_loop(preferred: "asyncio.AbstractEventLoop", coro,
+                           holder: Optional[set] = None) -> None:
+    """Run ``coro`` on ``preferred`` (the loop that made it); when that loop is gone,
+    fall back to whatever loop this thread is inside; when there is none, close the
+    coroutine instead of leaking an un-awaited warning (loop == process teardown).
+    ``holder`` keeps a strong reference while the task runs (loops only weakly
+    reference their tasks)."""
+
+    def _spawn() -> None:  # runs ON the target loop
+        task = asyncio.ensure_future(coro)
+        if holder is not None:
+            holder.add(task)
+            task.add_done_callback(holder.discard)
+
+    try:
+        current: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
+    except RuntimeError:
+        current = None
+    for loop in (preferred, current):
+        if loop is None or loop.is_closed():
+            continue
+        try:
+            loop.call_soon_threadsafe(_spawn)
+            return
+        except RuntimeError:
+            continue  # this loop died between the check and the call
+    coro.close()
+
+
 # ---------------------------------------------------------------------------
 # Adapter
 # ---------------------------------------------------------------------------
@@ -1256,6 +1301,11 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             self._poll_settle = DEFAULT_POLL_SETTLE
         self._poll_tasks: Dict[str, asyncio.Task] = {}
+        # Pending dangerous-command approval cards (exec approvals), keyed
+        # "exec:<room>:<message_id>" like pollstate records but held in memory only:
+        # the blocked agent thread dies with this process, so a card never outlives
+        # it usefully. Pruned by age when the next card is registered.
+        self._exec_cards: Dict[str, Dict[str, Any]] = {}
         raw_turns = extra.get("reaction_turns")
         if raw_turns is None:
             raw_turns = os.getenv(REACTION_TURNS_ENV, DEFAULT_REACTION_TURNS)
@@ -2573,6 +2623,8 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             return
         if await self._maybe_approval(token, parent_id, actor, emoji):
             return
+        if await self._maybe_exec_approval(token, parent_id, actor, emoji):
+            return
         if pollstate.keycap_index(emoji) is not None:
             recs = pollstate.find(store, room=token, kind="reaction", message_id=parent_id)
             if recs:
@@ -2683,6 +2735,141 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
                     f"first instead.")
             event = self._event_for(token, actor, text, parent_id, rec.get("thread") or None)
             await self.handle_message(event)
+        return True
+
+    # -- Exec-approval cards: 👍/👎 reactions answer dangerous-command prompts --
+
+    def _prune_exec_cards(self) -> None:
+        now = time.time()
+        for key in [k for k, c in self._exec_cards.items()
+                    if now - float(c.get("created") or 0) > EXEC_APPROVAL_TTL]:
+            self._exec_cards.pop(key, None)
+
+    @staticmethod
+    def _exec_approval_legend(choices) -> str:
+        """One line under the card saying what the seeded reactions do. The words come once per
+        card; the emoji themselves are placed as real reactions so the tap target is the card."""
+        parts = []
+        if "once" in choices:
+            parts.append(f"React \U0001F44D to approve this run, \U0001F44E to deny it")
+        else:
+            parts.append("React \U0001F44E to deny this")
+        extra = [f"`/approve {tier}`" for tier in ("session", "always") if tier in choices]
+        if extra:
+            parts.append("or " + " / ".join(extra) + " to allow it longer")
+        return "\n\n" + "; ".join(parts) + "."
+
+    async def _send_exec_approval_prompt(self, prompt: Any) -> SendResult:
+        """Render an exec-approval card: the shared prompt text plus a reaction legend, then the
+        bot seeds 👍/👎 on its own message so one tap answers it (same mechanism as Matrix's
+        reaction prompts, using Talk's reaction API). The runner only calls this when
+        ``supports_exec_approval_buttons()`` is true; ``SendResult.message_id`` lets the runner
+        edit the card in place when the approval times out."""
+        choices = list(prompt.choices)
+        result = await self.send(prompt.chat_id, prompt.text + self._exec_approval_legend(choices),
+                                  metadata=prompt.metadata)
+        if not result.success or not result.message_id:
+            return result
+        self._prune_exec_cards()
+        key = pollstate.record_key("exec", str(prompt.chat_id), str(result.message_id))
+        rec: Dict[str, Any] = {"key": key, "room": str(prompt.chat_id),
+                               "message_id": str(result.message_id),
+                               "session_key": prompt.session_key, "request_id": prompt.request_id,
+                               "choices": choices, "created": time.time(), "decided": False,
+                               "seeded": [], "loop": asyncio.get_running_loop()}
+        self._exec_cards[key] = rec
+        offer = [EXEC_APPROVAL_SEED[c] for c in ("once", "deny") if c in choices]
+        for emoji in offer:
+            if await self._add_reaction(rec["room"], rec["message_id"], emoji):
+                rec["seeded"].append(emoji)
+        # When the wait ends by any other path (/approve typed, the web dashboard, a
+        # timeout, an interrupt) the card is dead: retire it so a late reaction says so
+        # instead of pretending. The settle fires on the agent thread; hop back to an
+        # event loop — the send loop if it still runs, else this task's (they are the
+        # same gateway loop in production; a restart closes the old one).
+        try:
+            from tools.approval import observe_gateway_settle  # type: ignore
+
+            def _settled(_reason: str, _rec=rec) -> None:
+                try:
+                    _schedule_on_live_loop(_rec["loop"], self._retire_exec_card(_rec),
+                                           self._background_tasks)
+                except Exception as e:
+                    logger.debug("[%s] exec card retire skipped: %s", self.name, e)
+
+            observe_gateway_settle(prompt.session_key, prompt.request_id, _settled)
+        except Exception as e:
+            logger.debug("[%s] exec approval settle observer not armed: %s", self.name, e)
+        return result
+
+    async def _retire_exec_card(self, rec: Dict[str, Any], note: Optional[str] = None) -> None:
+        """Drop one pending approval card: forget it, clear our seeded reactions, optionally say
+        what happened on the card."""
+        if self._exec_cards.pop(rec.get("key", ""), None) is None and not rec.get("decided"):
+            return  # already retired by an earlier settle
+        for emoji in rec.get("seeded") or []:
+            await self._remove_reaction(rec["room"], rec["message_id"], emoji)
+        rec["seeded"] = []
+        if note:
+            await self._approval_note(rec["room"], rec["message_id"], note)
+
+    async def _maybe_exec_approval(self, token: str, parent_id: str,
+                                   actor: Dict[str, Optional[str]], emoji: str) -> bool:
+        """Handle a reaction on one of our exec-approval cards. True when ``parent_id`` is one
+        (even if the reaction does not count), so it never also reads as a yes/no answer."""
+        rec = self._exec_cards.get(pollstate.record_key("exec", token, parent_id))
+        if rec is None:
+            return False
+        bare = emoji.replace("\ufe0f", "")
+        choice = EXEC_APPROVAL_EMOJIS.get(bare)
+        if choice is None:
+            return True  # some other emoji on the card: decorative, not an answer
+        who = actor.get("display_name") or actor.get("id") or "They"
+        if rec.get("decided"):
+            await self._approval_note(token, parent_id, "That approval was already answered.")
+            return True
+        if choice not in rec["choices"]:
+            await self._approval_note(
+                token, parent_id,
+                "\U0001F44D to approve once isn't offered on this card (only deny) — the command "
+                "could not be shown in full, so nothing can be approved from here.")
+            return True
+        uid = str(actor.get("id") or "")
+        refused = None
+        try:
+            from gateway.approval_actor import approval_refusal  # type: ignore
+            refused = approval_refusal(rec["session_key"], uid, request_id=rec["request_id"],
+                                       extra=self.config.extra, choice=choice)
+        except Exception:
+            refused = None
+        if refused:
+            try:
+                from gateway.approval_actor import refusal_text  # type: ignore
+                note = refusal_text(refused)
+            except Exception:
+                note = f"Only {refused} can answer this approval."
+            await self._approval_note(token, parent_id, note)
+            return True
+        rec["decided"] = True
+        rec["decided_by"] = uid
+        try:
+            from tools.approval import resolve_gateway_approval_card  # type: ignore
+            count = resolve_gateway_approval_card(rec["session_key"], choice, rec["request_id"],
+                                                  actor_id=uid, extra=self.config.extra)
+        except Exception as e:
+            logger.warning("[%s] exec approval reaction %s on %s/%s failed to resolve: %s",
+                           self.name, emoji, token, parent_id, e)
+            count = 0
+        if not count:
+            self._exec_cards.pop(rec["key"], None)
+            await self._approval_note(token, parent_id,
+                                      "That approval had already been answered or timed out.")
+            return True
+        logger.info("[%s] exec approval %s in %s resolved %s by %s (%d waiter(s))", self.name,
+                    parent_id, token, choice, uid, count)
+        label = ("\u2705 Approved by" if choice != "deny" else "\U0001F44E Denied by")
+        await self._retire_exec_card(rec, note=f"{label} {who} — running it."
+                                       if choice != "deny" else f"{label} {who}.")
         return True
 
     def _event_for(self, token: str, actor: Dict[str, Optional[str]], text: str,
